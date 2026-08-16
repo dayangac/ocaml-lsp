@@ -354,3 +354,91 @@ type t =
      | B
     |}]
 ;;
+
+let%expect_test "deprecated alert text is mistaken for an unused diagnostic" =
+  let source =
+    {ocaml|module M = struct let x = 1 end [@@deprecated "unused open"]
+open M
+let y = x
+|ocaml}
+  in
+  let published_diagnostics = Fiber.Ivar.create () in
+  let handler =
+    Client.Handler.make
+      ~on_notification:(fun _ -> function
+        | PublishDiagnostics diagnostics ->
+          let* filled = Fiber.Ivar.peek published_diagnostics in
+          (match filled with
+           | Some _ -> Fiber.return ()
+           | None -> Fiber.Ivar.fill published_diagnostics diagnostics)
+        | _ -> Fiber.return ())
+      ()
+  in
+  Test.run_initialized ~handler (fun client ->
+    let* () = Test.open_document ~client ~uri:Helpers.uri ~source () in
+    let* { PublishDiagnosticsParams.diagnostics; _ } =
+      Fiber.Ivar.read published_diagnostics
+    in
+    let diagnostic =
+      List.find_exn diagnostics ~f:(fun (diagnostic : Diagnostic.t) ->
+        let message =
+          match diagnostic.message with
+          | `String message -> message
+          | `MarkupContent { value; _ } -> value
+        in
+        String.is_prefix message ~prefix:"Alert deprecated")
+    in
+    let textDocument = TextDocumentIdentifier.create ~uri:Helpers.uri in
+    let context =
+      CodeActionContext.create
+        ~diagnostics:[ diagnostic ]
+        ~only:[ CodeActionKind.QuickFix ]
+        ()
+    in
+    let params =
+      CodeActionParams.create ~textDocument ~range:diagnostic.range ~context ()
+    in
+    let* response = Client.request client (CodeAction params) in
+    Code_actions.print_code_action_result
+      ~filter:(function
+        | `CodeAction { title; _ } -> String.equal title "Remove unused open"
+        | `Command _ -> false)
+      response;
+    Test.shutdown_client client);
+  [%expect
+    {|
+    Code actions:
+    {
+      "diagnostics": [
+        {
+          "message": "Alert deprecated: module M\nunused open",
+          "range": {
+            "end": { "character": 6, "line": 1 },
+            "start": { "character": 5, "line": 1 }
+          },
+          "severity": 2,
+          "source": "ocamllsp"
+        }
+      ],
+      "edit": {
+        "documentChanges": [
+          {
+            "edits": [
+              {
+                "newText": "",
+                "range": {
+                  "end": { "character": 6, "line": 1 },
+                  "start": { "character": 5, "line": 1 }
+                }
+              }
+            ],
+            "textDocument": { "uri": "file:///test.ml", "version": 0 }
+          }
+        ]
+      },
+      "isPreferred": false,
+      "kind": "quickfix",
+      "title": "Remove unused open"
+    }
+    |}]
+;;
